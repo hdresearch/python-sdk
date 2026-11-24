@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: vers-sdk
+Version: 1.20.1
+Summary: SDK for chelsea_rest
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/hdresearch/python-sdk
+Project-URL: Repository, https://github.com/hdresearch/python-sdk
+Keywords: vers,sdk,api,vm,orchestration
+Requires-Python: >=3.10
+Requires-Dist: httpx>=0.24
