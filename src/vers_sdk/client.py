@@ -2,6 +2,7 @@
 # chelsea_rest v0.1.0
 
 import asyncio
+import base64
 import calendar
 import email.utils
 import logging
@@ -14,7 +15,7 @@ from typing import Any, Optional
 
 import httpx
 
-from .errors import APIError, APIConnectionError
+from .errors import APIError, APIConnectionError, APIConnectionTimeoutError
 from .models import *  # noqa: F403
 
 
@@ -54,7 +55,7 @@ _configure_logger()
 
 
 # Status codes that are retryable even though they are 4xx
-RETRYABLE_STATUS_CODES = {408, 409, 429}
+RETRYABLE_STATUS_CODES = {408, 429}
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -95,26 +96,28 @@ class VersSdkClient:
         timeout: float = 30.0,
         http_client: Optional[httpx.AsyncClient] = None,
     ):
-        self.base_url = base_url or os.environ.get("VERS_BASE_URL", "https://api.vers.sh")
+        self.base_url = (base_url or os.environ.get("VERS_BASE_URL", "https://api.vers.sh")).rstrip("/")
         self.api_key = api_key or os.environ.get("VERS_API_KEY")
         self.max_retries = max_retries
         self.timeout = timeout
         self._custom_headers: dict[str, str | None] = headers or {}
+        import platform as _platform
+        default_headers: dict[str, str] = {
+            "User-Agent": f"vers-sdk/1.20.1 python/{_platform.python_version()} {_platform.system().lower()}/{_platform.machine()}",
+        }
+        if self.api_key:
+            default_headers["Authorization"] = f"Bearer {self.api_key}"
+        self._default_headers = self._merge_headers(default_headers, self._custom_headers)
         if http_client is not None:
             self._client = http_client
+            self._owns_client = False
         else:
-            import platform as _platform
-            default_headers: dict[str, str] = {
-                "User-Agent": f"vers-sdk/1.20.1 python/{_platform.python_version()} {_platform.system().lower()}/{_platform.machine()}",
-            }
-            if self.api_key:
-                default_headers["Authorization"] = f"Bearer {self.api_key}"
-            merged = self._merge_headers(default_headers, self._custom_headers)
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers=merged,
+                headers=self._default_headers,
                 timeout=self.timeout,
             )
+            self._owns_client = True
 
     @staticmethod
     def _merge_headers(*sources: Optional[dict[str, str | None]]) -> dict[str, str]:
@@ -156,22 +159,54 @@ class VersSdkClient:
             headers=headers,
         )
 
+    def _resolve_url(self, path: str) -> str:
+        if path.startswith(("http://", "https://")):
+            return path
+        if not str(self._client.base_url):
+            return f"{self.base_url}{path}"
+        return path
+
     async def _request(self, method: str, path: str, options: RequestOptions | None = None, **kwargs: Any) -> httpx.Response:
         logger.debug("request: %s %s", method, path)
 
-        req_headers: dict[str, str] = kwargs.pop("headers", {})
-        if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
-            req_headers["X-Idempotency-Key"] = str(uuid.uuid4())
-        # Apply per-request header overrides
+        req_headers: dict[str, str] = {}
+        if not self._owns_client:
+            existing_lower = {k.lower() for k in self._client.headers.keys()}
+            for k, v in self._default_headers.items():
+                if k.lower() not in existing_lower:
+                    req_headers[k] = v
+
+        raw_headers = kwargs.pop("headers", None)
+        if raw_headers:
+            for k, v in raw_headers.items():
+                req_headers = {ek: ev for ek, ev in req_headers.items() if ek.lower() != k.lower()}
+                if v is not None:
+                    req_headers[k] = v
+
+        explicitly_removed: set[str] = set()
+        # Apply per-request header overrides (case-insensitive)
         if options and options.headers:
             for k, v in options.headers.items():
+                req_headers = {ek: ev for ek, ev in req_headers.items() if ek.lower() != k.lower()}
                 if v is None:
-                    req_headers.pop(k, None)
+                    explicitly_removed.add(k.lower())
                 else:
+                    explicitly_removed.discard(k.lower())
                     req_headers[k] = v
+
+        # Auto-generate Idempotency-Key once per mutating call (POST, DELETE) if omitted,
+        # and reuse the exact same key across retries.
+        if method.upper() in ("POST", "DELETE"):
+            has_idempotency = any(k.lower() == "idempotency-key" for k in req_headers) or any(
+                k.lower() == "idempotency-key" for k in self._client.headers.keys()
+            )
+            if not has_idempotency and "idempotency-key" not in explicitly_removed:
+                req_headers["Idempotency-Key"] = str(uuid.uuid4())
+
         if req_headers:
             kwargs["headers"] = req_headers
         effective_timeout = options.timeout if options and options.timeout is not None else None
+        url = self._resolve_url(path)
 
         last_exc: Optional[Exception] = None
         retry_after_used = False
@@ -184,8 +219,7 @@ class VersSdkClient:
                 req_kwargs = dict(kwargs)
                 if effective_timeout is not None:
                     req_kwargs["timeout"] = effective_timeout
-                response = await self._client.request(method, path, **req_kwargs)
-                # Remove headers that were set to None
+                response = await self._client.request(method, url, **req_kwargs)
                 logger.debug("response: %d for %s %s", response.status_code, method, path)
                 if _is_retryable_status(response.status_code) and attempt < self.max_retries:
                     ra_delay = _parse_retry_after(response.headers.get("retry-after"))
@@ -199,7 +233,12 @@ class VersSdkClient:
                 return response
             except APIError:
                 raise
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            except httpx.TimeoutException as exc:
+                logger.error("timeout error: %s %s - %s", method, path, exc)
+                if attempt == self.max_retries:
+                    raise APIConnectionTimeoutError(cause=exc) from exc
+                last_exc = exc
+            except httpx.TransportError as exc:
                 logger.error("connection error: %s %s - %s", method, path, exc)
                 if attempt == self.max_retries:
                     raise APIConnectionError(cause=exc) from exc
@@ -259,7 +298,10 @@ class VersSdkClient:
     async def wake_computer(self, computer_id: str, body: dict[str, Any] | None = None, options: RequestOptions | None = None) -> WakeComputerResponse:
         """Wake a sleeping computer, preserving its identity and execution state."""
         path = f"/api/v2/computers/{computer_id}/wake"
-        resp = await self._request("POST", path, options, json=body)
+        req_kwargs: dict[str, Any] = {}
+        if body:
+            req_kwargs["json"] = body
+        resp = await self._request("POST", path, options, **req_kwargs)
         if not resp.content:
             return {}
         return resp.json()
@@ -395,7 +437,12 @@ class VersSdkClient:
         if params is not None:
             if params.skip_wait_boot is not None:
                 query["skip_wait_boot"] = params.skip_wait_boot
-        resp = await self._request("POST", path, options, json=body, params=query)
+        req_kwargs: dict[str, Any] = {}
+        if query:
+            req_kwargs["params"] = query
+        if body:
+            req_kwargs["json"] = body
+        resp = await self._request("POST", path, options, **req_kwargs)
         if not resp.content:
             return {}
         return resp.json()
@@ -917,7 +964,10 @@ class VersSdkClient:
     async def validate_key(self, body: dict[str, Any] | None = None, options: RequestOptions | None = None) -> ValidateKeyResponse:
         """Validate the presented API key."""
         path = "/api/v2/keys/validate"
-        resp = await self._request("POST", path, options, json=body)
+        req_kwargs: dict[str, Any] = {}
+        if body:
+            req_kwargs["json"] = body
+        resp = await self._request("POST", path, options, **req_kwargs)
         if not resp.content:
             return {}
         return resp.json()
@@ -946,20 +996,40 @@ class VersSdkClient:
             return {}
         return resp.json()
 
-    async def read_computer_file(self, computer_id: str, params: ReadComputerFileParams | None = None, options: RequestOptions | None = None) -> VmReadFileResponse:
+    async def read_computer_file(self, computer_id: str, params: ReadComputerFileParams | str | None = None, options: RequestOptions | None = None) -> Any:
         """Read a file from a running computer."""
         path = f"/api/v2/computers/{computer_id}/files"
         query: dict[str, Any] = {}
-        if params is not None:
+        if isinstance(params, str):
+            query["path"] = params
+        elif params is not None:
             if params.path is not None:
                 query["path"] = params.path
         resp = await self._request("GET", path, options, params=query)
-        if not resp.content:
-            return {}
-        return resp.json()
+        ct = resp.headers.get("content-type", "")
+        if "application/json" in ct:
+            if not resp.content:
+                return {}
+            return resp.json()
+        return resp.content
 
-    async def write_computer_file(self, computer_id: str, body: dict[str, Any], params: WriteComputerFileParams | None = None, options: RequestOptions | None = None) -> Any:
-        """Write a file into a running computer."""
+    async def read_file(self, computer_id: str, path: str, options: RequestOptions | None = None) -> bytes:
+        """Read a file from a running computer and return its raw bytes."""
+        result = await self.read_computer_file(computer_id, ReadComputerFileParams(path=path), options=options)
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result)
+        if isinstance(result, dict) and "content_b64" in result:
+            return base64.b64decode(result["content_b64"])
+        return b""
+
+    async def write_computer_file(
+        self,
+        computer_id: str,
+        body: bytes | bytearray | memoryview | str | dict[str, Any],
+        params: WriteComputerFileParams | None = None,
+        options: RequestOptions | None = None,
+    ) -> Any:
+        """Write a file into a running computer (supports raw binary bytes/str or JSON dict)."""
         path = f"/api/v2/computers/{computer_id}/files"
         query: dict[str, Any] = {}
         if params is not None:
@@ -969,10 +1039,48 @@ class VersSdkClient:
                 query["mode"] = params.mode
             if params.create_dirs is not None:
                 query["create_dirs"] = params.create_dirs
-        resp = await self._request("PUT", path, options, json=body, params=query)
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            resp = await self._request(
+                "PUT",
+                path,
+                options,
+                content=bytes(body),
+                headers={"Content-Type": "application/octet-stream"},
+                params=query,
+            )
+        elif isinstance(body, str):
+            resp = await self._request(
+                "PUT",
+                path,
+                options,
+                content=body.encode("utf-8"),
+                headers={"Content-Type": "application/octet-stream"},
+                params=query,
+            )
+        else:
+            resp = await self._request("PUT", path, options, json=body, params=query)
         if not resp.content:
             return {}
         return resp.json()
+
+    async def write_file(
+        self,
+        computer_id: str,
+        path: str,
+        data: bytes | bytearray | memoryview | str,
+        *,
+        mode: int | None = None,
+        create_dirs: bool | None = None,
+        options: RequestOptions | None = None,
+    ) -> None:
+        """Write raw bytes or UTF-8 text to a file in a running computer using application/octet-stream."""
+        payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+        await self.write_computer_file(
+            computer_id,
+            payload,
+            params=WriteComputerFileParams(path=path, mode=mode, create_dirs=create_dirs),
+            options=options,
+        )
 
     async def get_computer_ssh_key(self, computer_id: str, options: RequestOptions | None = None) -> ComputerSshKeyResponse:
         """Return the customer-facing SSH key and port for a running computer."""
@@ -1037,7 +1145,8 @@ class VersSdkClient:
         return resp.json()
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
     async def __aenter__(self) -> "VersSdkClient":
         return self

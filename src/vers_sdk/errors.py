@@ -35,6 +35,8 @@ class APIError(VersSDKError):
         msg = None
         if isinstance(body, dict) and "message" in body:
             msg = body["message"] if isinstance(body["message"], str) else str(body["message"])
+        elif isinstance(body, dict) and "error" in body:
+            msg = body["error"] if isinstance(body["error"], str) else str(body["error"])
         elif body is not None:
             msg = str(body)
         elif message is not None:
@@ -102,8 +104,75 @@ class APIConnectionError(APIError):
 class APIConnectionTimeoutError(APIConnectionError):
     """Error thrown when a request times out."""
 
-    def __init__(self, message: str | None = None) -> None:
-        super().__init__(message=message or "Request timed out.")
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message=message or "Request timed out.", cause=cause)
+
+
+class VersOperationError(VersSDKError):
+    """Error raised when a durable v2 operation ends in a failed or quarantined state."""
+
+    operation_id: str
+    status: str
+    stage: str | None
+    code: str | None
+    message: str
+    cleanup_operation_id: str | None
+    operation: dict[str, Any] | None
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        status: str,
+        stage: str | None = None,
+        code: str | None = None,
+        message: str = "",
+        cleanup_operation_id: str | None = None,
+        operation: dict[str, Any] | None = None,
+    ) -> None:
+        self.operation_id = operation_id
+        self.status = status
+        self.stage = stage
+        self.code = code
+        self.message = message
+        self.cleanup_operation_id = cleanup_operation_id
+        self.operation = operation
+
+        parts = [f"Operation {operation_id} {status}"]
+        if stage:
+            parts.append(f"at stage '{stage}'")
+        if code:
+            parts.append(f"[{code}]")
+        detail = " ".join(parts)
+        if message:
+            detail = f"{detail}: {message}"
+        super().__init__(detail)
+
+    @classmethod
+    def from_operation(cls, operation: dict[str, Any]) -> VersOperationError:
+        failure = operation.get("failure")
+        code: str | None = None
+        message = ""
+        if isinstance(failure, dict):
+            raw_code = failure.get("code")
+            raw_msg = failure.get("message")
+            code = str(raw_code) if raw_code is not None else None
+            message = str(raw_msg) if raw_msg is not None else ""
+        elif failure is not None:
+            message = str(failure)
+        return cls(
+            operation_id=str(operation.get("operation_id", "")),
+            status=str(operation.get("status", "failed")),
+            stage=operation.get("stage"),
+            code=code,
+            message=message,
+            cleanup_operation_id=operation.get("cleanup_operation_id"),
+            operation=operation,
+        )
 
 
 class BadRequestError(APIError):

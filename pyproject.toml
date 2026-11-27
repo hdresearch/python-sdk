@@ -1,11 +1,18 @@
 [project]
 name = "vers-sdk"
 version = "1.20.1"
-description = "SDK for chelsea_rest"
+description = "Python SDK for the Vers v2 REST API"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 keywords = ["vers", "sdk", "api", "vm", "orchestration"]
 dependencies = ["httpx>=0.24"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
 
 [project.urls]
 Homepage = "https://github.com/hdresearch/python-sdk"
@@ -17,3 +24,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vers_sdk = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
